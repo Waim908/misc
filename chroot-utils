@@ -1,0 +1,227 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION="1.0.0"
+ROOTFS_BASE="/opt/rootfs"
+
+usage() {
+    cat << EOF
+chroot-utils v${VERSION} - Quick chroot container manager
+
+Usage:
+  chroot-utils --start <container>        Mount virtual filesystems and enter container
+  chroot-utils --rm <container>           Unmount and remove container
+  chroot-utils --mount <container> <host_dir> <container_dir>
+                                          Mount host directory into container
+  chroot-utils --umount <container> <container_dir>
+                                          Unmount directory from container
+  chroot-utils --list                     List available containers
+  chroot-utils --help                     Show this help
+
+Container rootfs should be extracted to: ${ROOTFS_BASE}/<container>/
+
+Examples:
+  chroot-utils --start arch               Start arch container
+  chroot-utils --rm arch                  Remove arch container
+  chroot-utils --mount arch /home/user /mnt
+EOF
+    exit 1
+}
+
+check_container() {
+    local container="$1"
+    local container_path="${ROOTFS_BASE}/${container}"
+
+    if [ ! -d "${container_path}" ]; then
+        echo "Error: container '${container}' not found at ${container_path}"
+        exit 1
+    fi
+}
+
+do_mount() {
+    local container="$1"
+    local container_path="${ROOTFS_BASE}/${container}"
+
+    echo "Mounting virtual filesystems for '${container}'..."
+
+    sudo mount --bind /proc "${container_path}/proc" || {
+        echo "Error: failed to mount /proc"
+        exit 1
+    }
+
+    sudo mount --bind /sys "${container_path}/sys" || {
+        echo "Error: failed to mount /sys"
+        do_umount "${container}"
+        exit 1
+    }
+
+    sudo mount --bind /dev "${container_path}/dev" || {
+        echo "Error: failed to mount /dev"
+        do_umount "${container}"
+        exit 1
+    }
+
+    sudo mount -t devpts devpts "${container_path}/dev/pts" -o gid=5,mode=620 || {
+        echo "Error: failed to mount devpts"
+        do_umount "${container}"
+        exit 1
+    }
+
+    if [ -d /dev/shm ]; then
+        sudo mount --bind /dev/shm "${container_path}/dev/shm" 2>/dev/null || true
+    fi
+
+    echo "Virtual filesystems mounted successfully"
+}
+
+do_umount() {
+    local container="$1"
+    local container_path="${ROOTFS_BASE}/${container}"
+
+    echo "Unmounting filesystems for '${container}'..."
+
+    sudo umount -l "${container_path}/dev/shm" 2>/dev/null || true
+    sudo umount -l "${container_path}/dev/pts" 2>/dev/null || true
+    sudo umount -l "${container_path}/dev" 2>/dev/null || true
+    sudo umount -l "${container_path}/sys" 2>/dev/null || true
+    sudo umount -l "${container_path}/proc" 2>/dev/null || true
+
+    echo "Filesystems unmounted successfully"
+}
+
+do_start() {
+    local container="$1"
+    check_container "${container}"
+
+    local container_path="${ROOTFS_BASE}/${container}"
+
+    do_mount "${container}"
+
+    local container_ps1="\[\e[1;31m\][${container}]\[\e[0m\] \u@\h:\w\$ "
+
+    echo "Entering chroot: ${container}"
+    echo "Type 'exit' to leave the container"
+    echo "---"
+
+    sudo PS1="${container_ps1}" chroot "${container_path}" /bin/bash || true
+
+    echo "---"
+    echo "Exited chroot. Unmounting..."
+    do_umount "${container}"
+}
+
+do_rm() {
+    local container="$1"
+    check_container "${container}"
+
+    local container_path="${ROOTFS_BASE}/${container}"
+
+    do_umount "${container}"
+
+    echo "Removing container '${container}'..."
+    sudo rm -rf "${container_path}"
+    echo "Container '${container}' removed"
+}
+
+do_mount_dir() {
+    local container="$1"
+    local host_dir="$2"
+    local container_dir="$3"
+
+    check_container "${container}"
+
+    local container_path="${ROOTFS_BASE}/${container}"
+    local target="${container_path}${container_dir}"
+
+    if [ ! -d "${host_dir}" ]; then
+        echo "Error: host directory '${host_dir}' does not exist"
+        exit 1
+    fi
+
+    sudo mkdir -p "${target}"
+
+    echo "Mounting ${host_dir} -> ${container}:${container_dir}"
+    sudo mount --bind "${host_dir}" "${target}" || {
+        echo "Error: failed to mount directory"
+        exit 1
+    }
+
+    echo "Mounted successfully"
+}
+
+do_umount_dir() {
+    local container="$1"
+    local container_dir="$2"
+
+    check_container "${container}"
+
+    local container_path="${ROOTFS_BASE}/${container}"
+    local target="${container_path}${container_dir}"
+
+    echo "Unmounting ${container}:${container_dir}"
+    sudo umount -l "${target}" || {
+        echo "Warning: failed to unmount or not mounted"
+    }
+
+    echo "Unmounted successfully"
+}
+
+do_list() {
+    echo "Available containers in ${ROOTFS_BASE}:"
+    echo "---"
+
+    if [ ! -d "${ROOTFS_BASE}" ]; then
+        echo "(no containers found - ${ROOTFS_BASE} does not exist)"
+        exit 0
+    fi
+
+    local found=0
+    for dir in "${ROOTFS_BASE}"/*/; do
+        if [ -d "${dir}" ]; then
+            local name=$(basename "${dir}")
+            local size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
+            echo "  ${name} (${size})"
+            found=1
+        fi
+    done
+
+    if [ ${found} -eq 0 ]; then
+        echo "(no containers found)"
+    fi
+}
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+case "$1" in
+    --start|-s)
+        [ $# -lt 2 ] && { echo "Error: container name required"; exit 1; }
+        do_start "$2"
+        ;;
+    --rm|-r)
+        [ $# -lt 2 ] && { echo "Error: container name required"; exit 1; }
+        do_rm "$2"
+        ;;
+    --mount|-m)
+        [ $# -lt 4 ] && { echo "Error: container, host_dir, and container_dir required"; exit 1; }
+        do_mount_dir "$2" "$3" "$4"
+        ;;
+    --umount|-u)
+        [ $# -lt 3 ] && { echo "Error: container and container_dir required"; exit 1; }
+        do_umount_dir "$2" "$3"
+        ;;
+    --list|-l)
+        do_list
+        ;;
+    --help|-h)
+        usage
+        ;;
+    --version|-V)
+        echo "chroot-utils v${VERSION}"
+        ;;
+    *)
+        echo "Error: unknown option '$1'"
+        usage
+        ;;
+esac
