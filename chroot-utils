@@ -1,50 +1,83 @@
 #!/bin/bash
-# chroot-utils v2.1.0 — 精简修复版
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.0.0"
 ROOTFS_BASE="/opt/rootfs"
 LOCK_DIR="/run/chroot-utils"
+STATE_DIR="/run/chroot-utils/state"
 
+# ─────────────────────────────────────────────
+# 全局错误处理
+# ─────────────────────────────────────────────
 die()  { echo "FATAL: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
 info() { echo "[*] $*"; }
 
-require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
+# ─────────────────────────────────────────────
+# 安全检查 1：必须在 root 下运行（或 sudo）
+# ─────────────────────────────────────────────
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        die "must run as root (use sudo)"
+    fi
+}
 
+# 规范化路径
 realpath_m() { realpath -m -- "$1"; }
 
 # ─────────────────────────────────────────────
-# 路径安全：先规范化，再做前缀匹配
+# 安全检查 2：禁止对宿主机关键路径操作
+#   先 realpath 规范化，再做前缀匹配
 # ─────────────────────────────────────────────
-assert_not_critical_host_path() {
-    local p; p="$(realpath_m "$1")"
-    [ -n "$p" ] || die "empty path"
-    [ "$p" = "/" ] && die "refusing to operate on /"
+assert_safe_path() {
+    local p
+    p="$(realpath_m "$1")"
+    if [ -z "$p" ]; then
+        die "empty path"
+    fi
+    if [ "$p" = "/" ]; then
+        die "refusing to operate on /"
+    fi
 
     local crit
     for crit in /proc /sys /dev /boot /etc /usr /bin /sbin /lib /lib64 \
-                /var /run /root /home /opt /srv /mnt /media; do
-        if [ "$p" = "$crit" ] || [[ "$p" == "$crit/"* ]]; then
+                /var /run /root /home /srv /mnt /media; do
+        if [ "$p" = "$crit" ]; then
+            die "refusing to operate on critical host path: $p"
+        fi
+        if [[ "$p" == "$crit/"* ]]; then
             die "refusing to operate on critical host path: $p"
         fi
     done
 }
 
-# 断言路径在 ROOTFS_BASE 之内（realpath 规范化后）
+# 断言路径在 ROOTFS_BASE 之内
 assert_inside_rootfs_base() {
-    local p; p="$(realpath_m "$1")"
-    local base; base="$(realpath_m "$ROOTFS_BASE")"
-    [ "$p" = "$base" ] && die "refusing to operate on ROOTFS_BASE itself"
-    [[ "$p" == "$base/"* ]] || die "path escapes ROOTFS_BASE: $p"
+    local p base
+    p="$(realpath_m "$1")"
+    base="$(realpath_m "$ROOTFS_BASE")"
+    if [ "$p" = "$base" ]; then
+        die "refusing to operate on ROOTFS_BASE itself"
+    fi
+    if [[ "$p" != "$base/"* ]]; then
+        die "path escapes ROOTFS_BASE: $p"
+    fi
 }
 
+# ─────────────────────────────────────────────
+# 安全检查 3：容器名白名单（防路径穿越）
+# ─────────────────────────────────────────────
 validate_container_name() {
     local name="$1"
-    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$ ]] \
-        || die "invalid container name: '$name'"
-    [[ "$name" == *".."* ]] && die "container name must not contain '..'"
-    [[ "$name" == *"/"* ]] && die "container name must not contain '/'"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$ ]]; then
+        die "invalid container name: '$name' (allowed: [a-zA-Z0-9_.-], 1-63 chars, must start alnum)"
+    fi
+    if [[ "$name" == *".."* ]]; then
+        die "container name must not contain '..'"
+    fi
+    if [[ "$name" == *"/"* ]]; then
+        die "container name must not contain '/'"
+    fi
 }
 
 # 返回容器根路径（已 realpath 校验）
@@ -52,51 +85,66 @@ container_root() {
     local name="$1"
     validate_container_name "$name"
     local root="${ROOTFS_BASE}/${name}"
-    [ -L "$root" ] && die "container path must not be a symlink: $root"
-    [ -d "$root" ] || die "container '$name' not found at $root"
+    if [ -L "$root" ]; then
+        die "container path must not be a symlink: $root"
+    fi
+    if [ ! -d "$root" ]; then
+        die "container '$name' not found at $root"
+    fi
     assert_inside_rootfs_base "$root"
-    assert_not_critical_host_path "$root"
     realpath_m "$root"
 }
 
+check_container() {
+    container_root "$1" >/dev/null
+}
+
 # ─────────────────────────────────────────────
-# 锁
+# 安全检查 4：全局锁，防止并发操作
 # ─────────────────────────────────────────────
 acquire_lock() {
     local name="$1"
-    [ -L "$LOCK_DIR" ] && die "LOCK_DIR is a symlink: $LOCK_DIR"
+    if [ -L "$LOCK_DIR" ]; then
+        die "LOCK_DIR is a symlink: $LOCK_DIR"
+    fi
     mkdir -p "$LOCK_DIR"
     chmod 0700 "$LOCK_DIR"
 
     local lockfile="${LOCK_DIR}/${name}.lock"
-    [ -L "$lockfile" ] && die "lock file is a symlink: $lockfile"
+    if [ -L "$lockfile" ]; then
+        die "lock file is a symlink: $lockfile"
+    fi
 
     exec {LOCK_FD}>"$lockfile" || die "cannot open lock file"
     flock -n "$LOCK_FD" || die "another instance is operating on '$name'"
     LOCK_NAME="$name"
 }
 
+# ─────────────────────────────────────────────
+# 安全检查 5：检测是否已挂载
+# ─────────────────────────────────────────────
 is_mounted() {
-    findmnt -rno TARGET -- "$1" >/dev/null 2>&1
+    local target="$1"
+    findmnt -rno TARGET -- "$target" >/dev/null 2>&1
 }
 
 # ─────────────────────────────────────────────
-# 宿主机污染检测
+# 安全检查 6：检测宿主机 /dev 是否被反向污染
 # ─────────────────────────────────────────────
 assert_host_clean() {
-    local base; base="$(realpath_m "$ROOTFS_BASE")"
+    local base
+    base="$(realpath_m "$ROOTFS_BASE")"
     local m src
     for m in /proc /sys /dev; do
         src=$(findmnt -rno SOURCE -- "$m" 2>/dev/null || true)
         case "$src" in
-            *"$base"*) die "host $m polluted by rootfs ($src)! Reboot recommended." ;;
+            *"$base"*) die "host $m is polluted by rootfs ($src)! Reboot recommended." ;;
         esac
     done
 }
 
 # ─────────────────────────────────────────────
 # 挂载 / 卸载
-# 记录已挂载点，退出时精确清理
 # ─────────────────────────────────────────────
 declare -a MOUNTED_POINTS=()
 track_mount() { MOUNTED_POINTS+=("$1"); }
@@ -104,7 +152,7 @@ track_mount() { MOUNTED_POINTS+=("$1"); }
 safe_bind() {
     local src="$1" dst="$2"
     if is_mounted "$dst"; then
-        warn "already mounted, skipping: $dst"
+        warn "already mounted, skipping bind: $dst"
         return 0
     fi
     mount --bind "$src" "$dst" || return 1
@@ -113,22 +161,39 @@ safe_bind() {
 
 do_mount() {
     local name="$1"
-    local root; root="$(container_root "$name")"
+    local root
+    root="$(container_root "$name")"
 
     assert_host_clean
 
     info "Mounting virtual filesystems for '$name'..."
 
+    local d
     for d in proc sys dev dev/pts dev/shm; do
         mkdir -p "${root}/${d}"
     done
 
-    safe_bind /proc "${root}/proc" || die "bind /proc failed"
-    safe_bind /sys  "${root}/sys"  || { do_umount "$name"; die "bind /sys failed"; }
-    safe_bind /dev  "${root}/dev"  || { do_umount "$name"; die "bind /dev failed"; }
+    if ! safe_bind /proc "${root}/proc"; then
+        die "bind /proc failed"
+    fi
 
-    if [ -d /dev/shm ]; then
-        safe_bind /dev/shm "${root}/dev/shm" 2>/dev/null || true
+    if ! safe_bind /sys "${root}/sys"; then
+        do_umount "$name"
+        die "bind /sys failed"
+    fi
+
+    if ! safe_bind /dev "${root}/dev"; then
+        do_umount "$name"
+        die "bind /dev failed"
+    fi
+
+    # /dev/shm 用独立 tmpfs，避免占用宿主内存 / 污染宿主
+    if ! is_mounted "${root}/dev/shm"; then
+        mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "${root}/dev/shm" \
+            || warn "mount /dev/shm failed (continuing)"
+        if is_mounted "${root}/dev/shm"; then
+            track_mount "${root}/dev/shm"
+        fi
     fi
 
     info "Virtual filesystems mounted"
@@ -140,21 +205,22 @@ do_umount() {
 
     info "Unmounting filesystems for '$name'..."
 
-    # 逆序卸载，先尝试正常 umount，失败再 lazy
+    # 逆序卸载，不用 -l，失败就报错
     local d t
     for d in dev/shm dev/pts dev sys proc; do
         t="${root}/${d}"
         if is_mounted "$t"; then
-            if ! umount "$t" 2>/dev/null; then
-                warn "normal umount failed for $t, retrying lazy"
-                umount -l "$t" 2>/dev/null || true
+            if ! umount "$t"; then
+                warn "umount failed for $t — a process may still be using it"
             fi
         fi
     done
 
     for d in dev/shm dev/pts dev sys proc; do
         t="${root}/${d}"
-        is_mounted "$t" && warn "STILL MOUNTED: $t"
+        if is_mounted "$t"; then
+            warn "STILL MOUNTED: $t — manual cleanup may be required"
+        fi
     done
 
     info "Filesystems unmounted"
@@ -165,13 +231,12 @@ do_umount() {
 # ─────────────────────────────────────────────
 do_start() {
     local name="$1"
-    container_root "$name" >/dev/null
+    check_container "$name"
     acquire_lock "$name"
 
     local root="${ROOTFS_BASE}/${name}"
 
-    # 退出时清理
-    trap 'do_umount "$name" || true' EXIT INT TERM
+    trap 'do_umount "$name" || true; exit' EXIT INT TERM
 
     do_mount "$name"
 
@@ -186,31 +251,53 @@ do_start() {
 
 # ─────────────────────────────────────────────
 # 删除容器
-# 【关键修复】
 #   1. realpath 规范化
 #   2. 必须在 ROOTFS_BASE 下
-#   3. 必须与父目录设备号不同（独立挂载点），否则二次确认
+#   3. 先 umount 容器内所有挂载（含 root 自身若是独立挂载点）
+#   4. 非独立文件系统直接拒绝（防误删宿主）
 # ─────────────────────────────────────────────
 do_rm() {
     local name="$1"
-    local root; root="$(container_root "$name")"
+    check_container "$name"
     acquire_lock "$name"
 
+    local root
+    root="$(container_root "$name")"
     assert_inside_rootfs_base "$root"
-    assert_not_critical_host_path "$root"
 
+    # 先卸载容器内虚拟文件系统
     do_umount "$name" || true
 
-    # 校验独立文件系统
+    # 卸载用户通过 --mount 建立的持久 bind（root 下的所有子挂载）
+    local mounts
+    mounts=$(findmnt -rno TARGET --submounts -- "$root" 2>/dev/null || true)
+    if [ -n "$mounts" ]; then
+        info "Unmounting submounts under $root ..."
+        echo "$mounts" | tac | while read -r m; do
+            if [ -z "$m" ]; then
+                continue
+            fi
+            if [[ "$m" != "$root"* ]]; then
+                continue
+            fi
+            umount "$m" 2>/dev/null || warn "cannot umount $m"
+        done
+    fi
+
+    # 检查 root 自身是否是独立挂载点
     local root_dev parent_dev
     root_dev=$(stat -c %d "$root")
     parent_dev=$(stat -c %d "$(dirname "$root")")
 
-    if [ "$root_dev" = "$parent_dev" ]; then
-        warn "container root is NOT a separate filesystem (dev=$root_dev)"
-        warn "rm -rf will operate inside the host filesystem tree"
-        read -r -p "Type container name '$name' to confirm deletion: " confirm
-        [ "$confirm" = "$name" ] || die "aborted"
+    if [ "$root_dev" != "$parent_dev" ]; then
+        # 独立挂载点：先 umount root 自身
+        if is_mounted "$root"; then
+            info "Unmounting $root (separate filesystem)"
+            umount "$root" || die "cannot umount $root — refusing to rm"
+        fi
+    else
+        # 同一个文件系统：rm -rf 会遍历宿主文件系统，拒绝
+        die "container root is NOT a separate filesystem (dev=$root_dev); refusing to rm for safety"
     fi
 
     info "Removing container '$name'..."
@@ -223,24 +310,45 @@ do_rm() {
 # ─────────────────────────────────────────────
 do_mount_dir() {
     local name="$1" host="$2" cdir="$3"
-    local root; root="$(container_root "$name")"
+    check_container "$name"
     acquire_lock "$name"
 
-    case "$host" in /*) ;; *) die "host_dir must be absolute" ;; esac
-    [ -e "$host" ] || die "host path '$host' does not exist"
-    [ -L "$host" ] && die "host path must not be a symlink"
+    local root
+    root="$(container_root "$name")"
 
-    local host_r; host_r="$(realpath_m "$host")"
-    assert_not_critical_host_path "$host_r"
+    # host 必须是绝对路径、存在、非符号链接
+    case "$host" in
+        /*) ;;
+        *) die "host_dir must be absolute" ;;
+    esac
+    if [ ! -e "$host" ]; then
+        die "host directory '$host' does not exist"
+    fi
+    if [ -L "$host" ]; then
+        die "host directory must not be a symlink"
+    fi
 
-    case "$cdir" in /*) ;; *) die "container_dir must be absolute" ;; esac
-    [[ "$cdir" == *".."* ]] && die "container_dir must not contain '..'"
+    local host_r
+    host_r="$(realpath_m "$host")"
+    assert_safe_path "$host_r"
 
-    local target; target="$(realpath_m "${root}${cdir}")"
+    # 容器内路径：绝对、无 ..
+    case "$cdir" in
+        /*) ;;
+        *) die "container_dir must be absolute" ;;
+    esac
+    if [[ "$cdir" == *".."* ]]; then
+        die "container_dir must not contain '..'"
+    fi
+
+    local target
+    target="$(realpath_m "${root}${cdir}")"
     assert_inside_rootfs_base "$target"
 
     mkdir -p "$target"
-    is_mounted "$target" && die "target already mounted: $target"
+    if is_mounted "$target"; then
+        die "target already mounted: $target"
+    fi
 
     info "Mounting $host_r -> $name:$cdir"
     mount --bind "$host_r" "$target" || die "bind failed"
@@ -249,17 +357,29 @@ do_mount_dir() {
 
 do_umount_dir() {
     local name="$1" cdir="$2"
-    local root; root="$(container_root "$name")"
+    check_container "$name"
 
-    case "$cdir" in /*) ;; *) die "container_dir must be absolute" ;; esac
-    [[ "$cdir" == *".."* ]] && die "container_dir must not contain '..'"
+    case "$cdir" in
+        /*) ;;
+        *) die "container_dir must be absolute" ;;
+    esac
+    if [[ "$cdir" == *".."* ]]; then
+        die "container_dir must not contain '..'"
+    fi
 
-    local target; target="$(realpath_m "${root}${cdir}")"
+    local root
+    root="$(container_root "$name")"
+    local target
+    target="$(realpath_m "${root}${cdir}")"
     assert_inside_rootfs_base "$target"
 
-    is_mounted "$target" || { warn "not mounted: $target"; return 0; }
+    if ! is_mounted "$target"; then
+        warn "not mounted: $target"
+        return 0
+    fi
 
-    local src; src=$(findmnt -rno SOURCE -- "$target" 2>/dev/null || true)
+    local src
+    src=$(findmnt -rno SOURCE -- "$target" 2>/dev/null || true)
     info "Unmounting $name:$cdir ($src)"
     umount "$target" || die "umount failed — refusing lazy umount for safety"
     info "Unmounted"
@@ -268,23 +388,36 @@ do_umount_dir() {
 do_list() {
     echo "Available containers in ${ROOTFS_BASE}:"
     echo "---"
-    [ -d "$ROOTFS_BASE" ] || { echo "(no containers found)"; return 0; }
+    if [ ! -d "$ROOTFS_BASE" ]; then
+        echo "(no containers found)"
+        return 0
+    fi
 
     local found=0
+    local dir n s flag
     for dir in "${ROOTFS_BASE}"/*/; do
-        [ -d "$dir" ] || continue
+        if [ ! -d "$dir" ]; then
+            continue
+        fi
         found=1
-        local n; n=$(basename "$dir")
-        local s; s=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
-        local flag=""
-        is_mounted "${dir}proc" && flag=" [proc mounted]"
-        is_mounted "${dir}dev"  && flag="${flag} [dev mounted]"
+        n=$(basename "$dir")
+        s=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
+        flag=""
+        if is_mounted "${dir}proc"; then
+            flag=" [proc mounted]"
+        fi
+        if is_mounted "${dir}dev"; then
+            flag="${flag} [dev mounted]"
+        fi
         echo "  ${n} (${s})${flag}"
     done
-    [ $found -eq 0 ] && echo "(no containers found)"
+    if [ $found -eq 0 ]; then
+        echo "(no containers found)"
+    fi
 }
 
 usage() {
+    local exit_code="${1:-1}"
     cat <<EOF
 chroot-utils v${VERSION}
 
@@ -299,22 +432,42 @@ Usage:
 
 Containers live in: ${ROOTFS_BASE}/<name>/
 EOF
-    exit 1
+    exit "$exit_code"
 }
 
 # ─────────────────────────────────────────────
 # 主入口
 # ─────────────────────────────────────────────
+# --help / --version 在 require_root 之前处理
+case "${1:-}" in
+    --help|-h)    usage 0 ;;
+    --version|-V) echo "chroot-utils v${VERSION}"; exit 0 ;;
+esac
+
 require_root
-[ $# -ge 1 ] || usage
+[ $# -ge 1 ] || usage 1
 
 case "$1" in
-    --start|-s)  [ $# -ge 2 ] || die "container name required"; do_start "$2" ;;
-    --rm|-r)     [ $# -ge 2 ] || die "container name required"; do_rm "$2" ;;
-    --mount|-m)  [ $# -ge 4 ] || die "container host_dir container_dir required"; do_mount_dir "$2" "$3" "$4" ;;
-    --umount|-u) [ $# -ge 3 ] || die "container container_dir required"; do_umount_dir "$2" "$3" ;;
-    --list|-l)   do_list ;;
-    --help|-h)   usage ;;
-    --version|-V) echo "chroot-utils v${VERSION}" ;;
-    *) die "unknown option '$1'" ;;
+    --start|-s)
+        [ $# -ge 2 ] || die "container name required"
+        do_start "$2"
+        ;;
+    --rm|-r)
+        [ $# -ge 2 ] || die "container name required"
+        do_rm "$2"
+        ;;
+    --mount|-m)
+        [ $# -ge 4 ] || die "container host_dir container_dir required"
+        do_mount_dir "$2" "$3" "$4"
+        ;;
+    --umount|-u)
+        [ $# -ge 3 ] || die "container container_dir required"
+        do_umount_dir "$2" "$3"
+        ;;
+    --list|-l)
+        do_list
+        ;;
+    *)
+        die "unknown option '$1'"
+        ;;
 esac
