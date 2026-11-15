@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-VERSION="3.1.0"
+VERSION="3.1.1"
 ROOTFS_BASE="${CHROOT_UTILS_ROOTFS:-/opt/rootfs}"
 ROOTFS_BASE="${ROOTFS_BASE%/}"
 STATE_BASE="${CHROOT_UTILS_STATE:-/var/lib/chroot-utils}"
@@ -275,37 +275,76 @@ do_create() {
     STAGING="$(mktemp -d "${ROOTFS_BASE}/.create-${name}.XXXXXX")" || die "cannot create staging dir in ${ROOTFS_BASE}"
     trap cleanup_partial EXIT
 
-    info "extracting $(basename "$tarball")"
-    case "$tarball" in
-        *.zst | *.zstd) tar --zstd -xf "$tarball" -C "$STAGING" || die "failed to extract ${tarball}" ;;
-        *) tar -xf "$tarball" -C "$STAGING" || die "failed to extract ${tarball}" ;;
-    esac
+    if [ "$downloaded" = "1" ]; then
+        info "extracting the downloaded archive"
+    else
+        info "extracting $(basename "$tarball")"
+    fi
 
-    # bootstrap 包里普遍套了一层 root.x86_64/，但别写死这个名字。判据：
-    # 只有一个顶层目录，且它里面有 etc/usr/var/bin/sbin/lib 里的好几个，
-    # 那它就是外壳。只有一个顶层目录但里面不像个根（比如只有 etc/），
-    # 说明那个目录本身就是根的一部分，不能剥。
+    # 归档来自 bsdtar 时 GNU tar 会为每个带 xattr 的成员骂一句
+    # "Ignoring unknown extended header keyword"，纯噪声，压掉。
+    local -a tarargs=(-xf "$tarball" -C "$STAGING")
+    case "$tarball" in
+        *.zst | *.zstd) tarargs=(--zstd "${tarargs[@]}") ;;
+    esac
+    if tar --help 2> /dev/null | grep -q -- '--warning'; then
+        tarargs=(--warning=no-unknown-keyword "${tarargs[@]}")
+    fi
+    tar "${tarargs[@]}" || die "failed to extract ${tarball}"
+
+    # bootstrap 包常见形态：一个外壳目录（root.x86_64/）外加 pkglist.x86_64.txt、
+    # version 这类兄弟文件。所以不能按「唯一顶层目录」判外壳——兄弟文件会让它漏判，
+    # 而只含 etc/ 的包又会被误剥。判据改成「顶层里那个本身就是个根的目录」：
+    # 自己有 etc/，并且有 usr/ 或 bin/。注意不能只看 etc|usr|var|bin|lib 里命中
+    # 几个——扁平打出来的 rootfs 顶层那个 usr/ 也能命中好几个，会被误当成外壳。
     local -a top=()
     shopt -s nullglob dotglob
     top=("$STAGING"/*)
     shopt -u nullglob dotglob
 
-    local src="$STAGING" markers=0 m
-    if [ "${#top[@]}" -eq 1 ] && [ -d "${top[0]}" ] && [ ! -L "${top[0]}" ]; then
-        for m in etc usr var bin sbin lib lib64; do
-            if [ -e "${top[0]}/$m" ] || [ -L "${top[0]}/$m" ]; then
-                markers=$((markers + 1))
-            fi
-        done
-        if [ "$markers" -ge 3 ]; then
-            src="${top[0]}"
-            info "stripping top-level directory: $(basename "$src")"
-        else
-            info "single top-level directory $(basename "${top[0]}") is part of the rootfs, keeping it"
+    local src="$STAGING" shell="" candidates=0 d
+    for d in "${top[@]}"; do
+        if [ ! -d "$d" ] || [ -L "$d" ]; then
+            continue
         fi
+        if [ ! -d "$d/etc" ]; then
+            continue
+        fi
+        if [ ! -d "$d/usr" ] && [ ! -d "$d/bin" ] && [ ! -L "$d/bin" ]; then
+            continue
+        fi
+        candidates=$((candidates + 1))
+        shell="$d"
+    done
+
+    if [ "$candidates" -eq 1 ]; then
+        src="$shell"
+        info "stripping top-level directory: $(basename "$src")"
+    elif [ "$candidates" -gt 1 ]; then
+        die "several top-level directories look like a rootfs; refusing to guess which one to use"
+    fi
+
+    if [ ! -d "${src}/etc" ] && [ ! -d "${src}/usr" ]; then
+        die "archive does not look like a rootfs (no etc/ or usr/ in it); nothing created"
     fi
 
     mv -- "$src" "$path" || die "failed to move rootfs into ${path}"
+
+    # 外壳剥掉后剩下的兄弟文件（Arch 的 pkglist.x86_64.txt、version）一起放进
+    # 容器根，不留在 ROOTFS_BASE 里，也不丢。
+    if [ "$src" != "$STAGING" ]; then
+        local f moved=""
+        shopt -s nullglob
+        for f in "$STAGING"/*; do
+            if mv -n -- "$f" "$path/" 2> /dev/null; then
+                moved="${moved} ${f##*/}"
+            fi
+        done
+        shopt -u nullglob
+        if [ -n "$moved" ]; then
+            info "also moved archive metadata into the container:${moved}"
+        fi
+    fi
 
     if [ "$downloaded" = "1" ]; then
         rm -f -- "$tarball"
