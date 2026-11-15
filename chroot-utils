@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-VERSION="3.1.1"
+VERSION="3.2.0"
 ROOTFS_BASE="${CHROOT_UTILS_ROOTFS:-/opt/rootfs}"
 ROOTFS_BASE="${ROOTFS_BASE%/}"
 STATE_BASE="${CHROOT_UTILS_STATE:-/var/lib/chroot-utils}"
@@ -55,7 +55,8 @@ usage() {
 chroot-utils v${VERSION} - chroot 容器管理
 
 用法:
-  chroot-utils --create <容器> [来源]       下载 Arch bootstrap 并建容器
+  chroot-utils --create <容器> [来源] [--upgrade]
+                                             下载 Arch bootstrap 并建好容器
   chroot-utils --start <容器> [-- 命令...]   进入容器（默认 /bin/bash）
   chroot-utils --mount <容器> <宿主目录> <容器内目录>
                                              登记一个绑定挂载，下次 --start 生效
@@ -78,8 +79,21 @@ chroot-utils v${VERSION} - chroot 容器管理
   南大、上交的 Arch bootstrap 镜像）。包内顶层目录名不限，脚本自己判断是否
   需要剥掉一层，剥完落到 ${ROOTFS_BASE}/<容器>/。
 
+  Arch 容器建好后会自动做完下面这些，不用再照教程一步步来：
+
+    1. mirrorlist 换成国内四个源（原文件存为 mirrorlist.dist）
+    2. pacman.conf 里的 CheckSpace 注释掉，否则 -Syu 会报
+       "could not determine cachedir mount point" 然后当成磁盘空间不足中止
+    3. pacman-key --init 和 --populate archlinux，否则每个包都报
+       "signature from ... is unknown trust"，pacman 还会把它当成包损坏
+    4. 生成 en_US.UTF-8 locale，避免宿主 locale 一带进去就一串警告
+    5. 问一句要不要顺手 pacman -Syu 升到最新（--upgrade 直接升，非交互环境不升）
+
+  1 到 4 都是离线的，任何一步失败只警告并给出容器内手动补的命令，不阻断建容器。
+
 示例:
   chroot-utils --create arch
+  chroot-utils --create arch -u
   chroot-utils --create arch ./archlinux-bootstrap-x86_64.tar.zst
   chroot-utils --start arch
   chroot-utils --start arch -- /bin/zsh
@@ -226,11 +240,14 @@ cleanup_partial() {
 }
 
 do_create() {
-    local name="$1" source="${2-}"
+    local name="$1" source="${2-}" upgrade="${3:-0}"
     validate_name "$name"
     local path
     path="$(container_path "$name")"
     [ -e "$path" ] && die "container '${name}' already exists at ${path}"
+
+    local -a self=("$SELF")
+    [ -x "$SELF" ] || self=("${BASH:-/bin/bash}" "$SELF")
 
     mkdir -p "$ROOTFS_BASE"
 
@@ -358,6 +375,62 @@ do_create() {
         fi
         printf '# written by chroot-utils --create\n%s\n' "$PACMAN_MIRRORS" > "$mirrorlist"
         info "pacman mirrorlist: tuna / ustc / nju / sjtu（原文件存为 mirrorlist.dist）"
+
+        # chroot 里 pacman 算不出 cachedir 的挂载点，-Syu 会在提交事务时直接
+        # 报 "could not determine cachedir mount point" 再跟一句
+        # "failed to commit transaction (not enough free disk space)" 中止。
+        # 这个检查依赖它自己那套挂载点探测，在 chroot 里没有意义，关掉。
+        # 原行留成注释，需要时自己开回来。
+        local pacman_conf="${path}/etc/pacman.conf"
+        if [ -f "$pacman_conf" ] && grep -qE '^[[:space:]]*CheckSpace[[:space:]]*$' "$pacman_conf"; then
+            sed -i 's/^[[:space:]]*CheckSpace[[:space:]]*$/#CheckSpace  # disabled by chroot-utils, pacman cannot resolve the cachedir mount point in a chroot/' "$pacman_conf"
+            info "pacman.conf: CheckSpace 已注释（chroot 里算不出 cachedir 挂载点）"
+        fi
+
+        # bootstrap 包的 keyring 是空的，不 populate 就装不了东西：每个包都会报
+        # "signature from ... is unknown trust"，pacman 还把它当成包损坏。
+        # 这一步离线可做（密钥就在包里），借 --start 的挂载命名空间跑一次。
+        if [ -x "${path}/usr/bin/pacman-key" ]; then
+            info "populating the pacman keyring inside the container"
+            if "${self[@]}" --start "$name" -- /usr/bin/pacman-key --init > /dev/null \
+                && "${self[@]}" --start "$name" -- /usr/bin/pacman-key --populate archlinux > /dev/null; then
+                info "keyring ready"
+            else
+                warn "could not populate the keyring automatically; run inside the container:"
+                warn "  pacman-key --init && pacman-key --populate archlinux"
+            fi
+        fi
+
+        # bootstrap 里一个 locale 都没生成，宿主的 LC_ALL 一带进去就满屏
+        # "cannot change locale" 警告，perl/python 处理非 ASCII 也会出问题。
+        # 启用 en_US.UTF-8 生成一份，够用且离线。
+        if [ -f "${path}/etc/locale.gen" ] && [ -x "${path}/usr/bin/locale-gen" ]; then
+            if grep -qE '^#[[:space:]]*en_US\.UTF-8[[:space:]]+UTF-8' "${path}/etc/locale.gen"; then
+                sed -i -E 's/^#[[:space:]]*(en_US\.UTF-8[[:space:]]+UTF-8)/\1/' "${path}/etc/locale.gen"
+                if "${self[@]}" --start "$name" -- /usr/bin/locale-gen > /dev/null 2>&1; then
+                    info "locale: en_US.UTF-8 已生成"
+                else
+                    warn "locale-gen failed; enter the container and run locale-gen"
+                fi
+            fi
+        fi
+
+        # 完整升级：bootstrap 的包总是比仓库旧，多数教程第一步就是 -Syu。
+        # 下行为默认问一句，-u 直接做，非交互环境则不做。
+        if [ "$upgrade" != "1" ] && [ -t 0 ]; then
+            printf 'run pacman -Syu now to bring it up to date? (downloads about 100M) [y/N] '
+            local answer=""
+            read -r answer || answer=""
+            case "$answer" in
+                y | Y | yes | YES) upgrade=1 ;;
+            esac
+        fi
+        if [ "$upgrade" = "1" ]; then
+            info "upgrading the container (pacman -Syu --noconfirm)"
+            if ! "${self[@]}" --start "$name" -- /usr/bin/pacman -Syu --noconfirm; then
+                warn "pacman -Syu failed; enter the container and finish it there"
+            fi
+        fi
     else
         warn "archive has no usr/bin/pacman; skipped Arch post-setup"
     fi
@@ -365,7 +438,7 @@ do_create() {
     info "container '${name}' created at ${path}"
     info "next:"
     info "  ${SELF} --start ${name}"
-    info "  容器里第一件事: pacman-key --init && pacman-key --populate archlinux"
+    info "  容器里 pacman -Syu 就能正常装，不会再卡在 CheckSpace 或 unknown trust"
 }
 
 do_start() {
@@ -429,6 +502,11 @@ do_enter() {
     mount --rbind /dev "${path}/dev" || die "failed to mount /dev"
     mount --make-rslave "${path}/dev" || die "failed to make /dev rslave"
 
+    # /run 按惯例是 tmpfs，用一份空的，别让容器里的服务往镜像里写东西。
+    mkdir -p "${path}/run"
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "${path}/run" \
+        || warn "failed to mount a tmpfs on /run"
+
     # 容器里要能解析 DNS。宿主那份 resolv.conf 只读 bind 进来，同样只活在
     # 这个命名空间里。容器内没有这个文件就先建一个空壳当挂载点；是符号链接
     # 的（systemd-resolved 那套）不动，避免把链接指向的目标顶掉。
@@ -455,6 +533,12 @@ do_enter() {
     ps1="\[\e[1;31m\][${name}]\[\e[0m\] \u@\h:\w\$ "
     export PS1="$ps1"
     export TERM="${TERM:-xterm}"
+
+    # 宿主的 LC_ALL/LANG 带进一个没生成 locale 的容器，每次起 shell 都是一串
+    # "cannot change locale" 警告。给个容器里一定存在的 UTF-8 locale，
+    # 想用别的就 CHROOT_UTILS_LANG=zh_CN.UTF-8（容器里得先生成）。
+    export LANG="${CHROOT_UTILS_LANG:-C.UTF-8}"
+    unset LC_ALL LC_CTYPE LC_COLLATE LC_MESSAGES LC_NUMERIC LC_TIME LC_MONETARY
 
     exec chroot "$path" "${cmd[@]}"
 }
@@ -649,7 +733,12 @@ case "${1-}" in
             *)
                 if [ "$(id -u)" -ne 0 ]; then
                     command -v sudo > /dev/null 2>&1 || die "must run as root"
-                    exec sudo -E "$SELF" "$@"
+                    # 没有终端就别让 sudo 卡在密码提示上，-n 直接失败。
+                    if [ -t 0 ]; then
+                        exec sudo -E "$SELF" "$@"
+                    else
+                        exec sudo -n -E "$SELF" "$@"
+                    fi
                 fi
                 ;;
         esac
@@ -657,7 +746,23 @@ case "${1-}" in
         case "$1" in
             --create | -c)
                 [ $# -ge 2 ] || die "container name required"
-                do_create "$2" "${3-}"
+                name="$2"
+                shift 2
+                src=""
+                upgrade=0
+                for a in "$@"; do
+                    case "$a" in
+                        --upgrade) upgrade=1 ;;
+                        *)
+                            if [ -z "$src" ]; then
+                                src="$a"
+                            else
+                                die "unexpected argument: ${a}"
+                            fi
+                            ;;
+                    esac
+                done
+                do_create "$name" "$src" "$upgrade"
                 ;;
             --start | -s)
                 [ $# -ge 2 ] || die "container name required"
