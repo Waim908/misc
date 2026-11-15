@@ -1,227 +1,667 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# chroot-utils - chroot 容器管理
+#
+# 为什么放弃「在宿主机命名空间里往 rootfs 里 bind mount」：
+#   1. 容器已经在后台跑着，再执行一次挂载会在同一个挂载点上再叠一层；
+#      后启动的那一次退出时执行 umount，拆掉的是前一个会话的挂载，
+#      正在跑的容器当场坏掉。
+#   2. 用户 bind 了宿主机目录之后，只要 --rm 时挂载还没拆干净，rm -rf
+#      就会顺着挂载点把宿主机那个目录里的东西删掉。挂载点是 rootfs 里的
+#      路径，删起来毫无边界感。
+#
+# 这一版的处理方式：
+#   * 每次进入都用 unshare -m 开一个私有挂载命名空间，proc/sys/dev 和用户
+#     bind 全在里面做。会话结束内核把整棵挂载树一起丢掉，宿主机上不存在
+#     「还没 umount 的残留」这种东西，因此也就没有卸载顺序、卸载失败、
+#     以及删容器时误删宿主机目录的问题。
+#   * 命名空间彼此独立，所以同一个容器重复 --start 不会叠加挂载，后台已有
+#     会话时再起一个也互不影响。
+#   * --mount 只写清单，在之后每次 --start 的命名空间里生效。它不碰宿主机
+#     挂载表，因此对已经跑着的会话没有任何影响（也确实改不了那个会话）。
+#   * --rm 的三道门：没有进程还留在容器里、容器下没有任何挂载（含其他命名
+#     空间里的）、目标目录不是符号链接。全过了才用 rm -rf --one-file-system
+#     删 ROOTFS_BASE 下的那一个目录。
+
 set -euo pipefail
 
-VERSION="1.0.0"
-ROOTFS_BASE="/opt/rootfs"
+VERSION="3.1.0"
+ROOTFS_BASE="${CHROOT_UTILS_ROOTFS:-/opt/rootfs}"
+ROOTFS_BASE="${ROOTFS_BASE%/}"
+STATE_BASE="${CHROOT_UTILS_STATE:-/var/lib/chroot-utils}"
+STATE_BASE="${STATE_BASE%/}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+# Arch Linux bootstrap 包，按顺序试国内镜像。都是 iso/latest 下的滚动包，
+# 目录名固定，不需要去解析 index。
+BOOTSTRAP_URLS=(
+    "https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+    "https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+    "https://mirrors.nju.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+    "https://mirror.sjtu.edu.cn/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+)
+
+# Arch 容器默认写这份 mirrorlist（pacman 用）
+PACMAN_MIRRORS='Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirrors.ustc.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirrors.nju.edu.cn/archlinux/$repo/os/$arch
+Server = https://mirror.sjtu.edu.cn/archlinux/$repo/os/$arch'
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    cat << EOF
-chroot-utils v${VERSION} - Quick chroot container manager
+    cat <<EOF
+chroot-utils v${VERSION} - chroot 容器管理
 
-Usage:
-  chroot-utils --start <container>        Mount virtual filesystems and enter container
-  chroot-utils --rm <container>           Unmount and remove container
-  chroot-utils --mount <container> <host_dir> <container_dir>
-                                          Mount host directory into container
-  chroot-utils --umount <container> <container_dir>
-                                          Unmount directory from container
-  chroot-utils --list                     List available containers
-  chroot-utils --help                     Show this help
+用法:
+  chroot-utils --create <容器> [来源]       下载 Arch bootstrap 并建容器
+  chroot-utils --start <容器> [-- 命令...]   进入容器（默认 /bin/bash）
+  chroot-utils --mount <容器> <宿主目录> <容器内目录>
+                                             登记一个绑定挂载，下次 --start 生效
+  chroot-utils --umount <容器> <容器内目录>  撤销登记
+  chroot-utils --mounts <容器>               列出已登记的绑定挂载
+  chroot-utils --rm <容器> [-y]              删除容器（无挂载、无进程才允许）
+  chroot-utils --cleanup <容器>              清理旧版本留下的残留挂载，不删文件
+  chroot-utils --list                        列出容器、会话状态、绑定挂载数
+  chroot-utils --help | --version
 
-Container rootfs should be extracted to: ${ROOTFS_BASE}/<container>/
+说明:
+  容器根目录：${ROOTFS_BASE}/<容器>/
+  挂载清单：  ${STATE_BASE}/<容器>.mounts
 
-Examples:
-  chroot-utils --start arch               Start arch container
-  chroot-utils --rm arch                  Remove arch container
+  proc、sys、dev 与 --mount 登记的目录只在本次会话的私有挂载命名空间里存在，
+  退出即随命名空间消失。宿主机上不产生任何指向容器的挂载点，这是重复启动和
+  删除容器都不会毁数据的原因。
+
+  来源可以是 http/https 链接、本地 tar 包路径，或省略（依次试清华、中科大、
+  南大、上交的 Arch bootstrap 镜像）。包内顶层目录名不限，脚本自己判断是否
+  需要剥掉一层，剥完落到 ${ROOTFS_BASE}/<容器>/。
+
+示例:
+  chroot-utils --create arch
+  chroot-utils --create arch ./archlinux-bootstrap-x86_64.tar.zst
+  chroot-utils --start arch
+  chroot-utils --start arch -- /bin/zsh
   chroot-utils --mount arch /home/user /mnt
+  chroot-utils --rm arch
 EOF
-    exit 1
 }
 
-check_container() {
-    local container="$1"
-    local container_path="${ROOTFS_BASE}/${container}"
+validate_name() {
+    local name="${1-}"
+    case "$name" in
+        "" | "." | "..") die "invalid container name: '${name}'" ;;
+        */*) die "invalid container name: '${name}'" ;;
+        *[[:space:]]*) die "invalid container name: '${name}'" ;;
+    esac
+}
 
-    if [ ! -d "${container_path}" ]; then
-        echo "Error: container '${container}' not found at ${container_path}"
-        exit 1
+container_path() {
+    printf '%s/%s' "$ROOTFS_BASE" "$1"
+}
+
+require_container() {
+    local path
+    path="$(container_path "$1")"
+    [ -d "$path" ] || die "container '$1' not found at ${path}"
+    printf '%s' "$path"
+}
+
+manifest_path() {
+    printf '%s/%s.mounts' "$STATE_BASE" "$1"
+}
+
+# 列出 root 之下（含 root 本身）的挂载点。
+# scope=self 只看本进程的挂载视图，all 连其他命名空间里的也一起看。
+mounts_under() {
+    local root="$1" scope="${2:-all}"
+    if [ "$scope" = "self" ]; then
+        set -- /proc/self/mountinfo
+    else
+        set -- /proc/self/mountinfo /proc/[0-9]*/mountinfo
     fi
+    awk -v root="$root" '
+        { target = $5; gsub(/\\040/, " ", target) }
+        target == root || index(target, root "/") == 1 { print target }
+    ' "$@" 2>/dev/null | sort -u
 }
 
-do_mount() {
-    local container="$1"
-    local container_path="${ROOTFS_BASE}/${container}"
+# 容器里还有没有活着的进程：chroot 之后 /proc/<pid>/root 就指向容器根。
+container_in_use() {
+    local path="$1" pid link
+    for pid in /proc/[0-9]*; do
+        [ -d "$pid" ] || continue
+        link="$(readlink "$pid/root" 2>/dev/null)" || continue
+        case "$link" in
+            "$path" | "$path"/*)
+                printf 'pid %s (root: %s)\n' "${pid##*/}" "$link"
+                return 0
+                ;;
+        esac
+        link="$(readlink "$pid/cwd" 2>/dev/null)" || continue
+        case "$link" in
+            "$path" | "$path"/*)
+                printf 'pid %s (cwd: %s)\n' "${pid##*/}" "$link"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
 
-    echo "Mounting virtual filesystems for '${container}'..."
+# 深层优先，先拆子挂载再拆父挂载
+unmount_listed() {
+    local mnt failed=0
+    while IFS= read -r mnt; do
+        [ -n "$mnt" ] || continue
+        if umount "$mnt" 2>/dev/null; then
+            info "  unmounted ${mnt}"
+        elif umount -l "$mnt" 2>/dev/null; then
+            warn "  lazy-unmounted ${mnt} (还有进程占着它)"
+            failed=1
+        else
+            warn "  failed to unmount ${mnt}"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
 
-    sudo mount --bind /proc "${container_path}/proc" || {
-        echo "Error: failed to mount /proc"
-        exit 1
-    }
+do_cleanup() {
+    validate_name "$1"
+    local path
+    path="$(require_container "$1")"
 
-    sudo mount --bind /sys "${container_path}/sys" || {
-        echo "Error: failed to mount /sys"
-        do_umount "${container}"
-        exit 1
-    }
+    local leftover
+    leftover="$(mounts_under "$path" self | sort -r)"
 
-    sudo mount --bind /dev "${container_path}/dev" || {
-        echo "Error: failed to mount /dev"
-        do_umount "${container}"
-        exit 1
-    }
-
-    sudo mount -t devpts devpts "${container_path}/dev/pts" -o gid=5,mode=620 || {
-        echo "Error: failed to mount devpts"
-        do_umount "${container}"
-        exit 1
-    }
-
-    if [ -d /dev/shm ]; then
-        sudo mount --bind /dev/shm "${container_path}/dev/shm" 2>/dev/null || true
+    if [ -z "$leftover" ]; then
+        info "nothing mounted under ${path}"
+        return 0
     fi
 
-    echo "Virtual filesystems mounted successfully"
+    info "unmounting mount(s) under ${path}"
+    unmount_listed <<< "$leftover" || true
+
+    leftover="$(mounts_under "$path" all)"
+    if [ -n "$leftover" ]; then
+        printf 'error: 仍有挂载没有拆掉，先让占用它们的进程退出：\n' >&2
+        printf '%s\n' "$leftover" | sed 's/^/  /' >&2
+        return 1
+    fi
+    info "clean"
 }
 
-do_umount() {
-    local container="$1"
-    local container_path="${ROOTFS_BASE}/${container}"
+# 下载到 ROOTFS_BASE 下的临时文件：rootfs 动辄几百 M，/tmp 常常是 tmpfs。
+# 成功时把落地的临时文件路径打到 stdout，失败时返回非零。
+fetch_bootstrap() {
+    local name="$1" url="$2" out
+    out="$(mktemp "${ROOTFS_BASE}/.download-${name}.XXXXXX")" || return 1
+    if command -v curl > /dev/null 2>&1; then
+        curl -fL --retry 2 --connect-timeout 10 --progress-bar -o "$out" "$url" && {
+            printf '%s' "$out"
+            return 0
+        }
+    elif command -v wget > /dev/null 2>&1; then
+        wget -q --show-progress -O "$out" "$url" && {
+            printf '%s' "$out"
+            return 0
+        }
+    else
+        die "need curl or wget to download"
+    fi
+    rm -f -- "$out"
+    return 1
+}
 
-    echo "Unmounting filesystems for '${container}'..."
+cleanup_partial() {
+    if [ -n "${STAGING:-}" ] && [ -d "$STAGING" ]; then
+        rm -rf -- "$STAGING"
+    fi
+    if [ -n "${TARBALL_TMP:-}" ] && [ -f "$TARBALL_TMP" ]; then
+        rm -f -- "$TARBALL_TMP"
+    fi
+    return 0
+}
 
-    sudo umount -l "${container_path}/dev/shm" 2>/dev/null || true
-    sudo umount -l "${container_path}/dev/pts" 2>/dev/null || true
-    sudo umount -l "${container_path}/dev" 2>/dev/null || true
-    sudo umount -l "${container_path}/sys" 2>/dev/null || true
-    sudo umount -l "${container_path}/proc" 2>/dev/null || true
+do_create() {
+    local name="$1" source="${2-}"
+    validate_name "$name"
+    local path
+    path="$(container_path "$name")"
+    [ -e "$path" ] && die "container '${name}' already exists at ${path}"
 
-    echo "Filesystems unmounted successfully"
+    mkdir -p "$ROOTFS_BASE"
+
+    local tarball="" downloaded=0 u
+    local -a urls=()
+    case "$source" in
+        "")
+            urls=("${BOOTSTRAP_URLS[@]}")
+            ;;
+        http://* | https://*)
+            urls=("$source")
+            ;;
+        *)
+            [ -f "$source" ] || die "no such file: ${source}"
+            tarball="$(readlink -f "$source")"
+            ;;
+    esac
+
+    if [ -z "$tarball" ]; then
+        for u in "${urls[@]}"; do
+            info "downloading ${u}"
+            if tarball="$(fetch_bootstrap "$name" "$u")" && [ -n "$tarball" ]; then
+                downloaded=1
+                break
+            fi
+            tarball=""
+            warn "failed: ${u}"
+        done
+        [ -n "$tarball" ] || die "no mirror worked; pass a local tarball path or a URL"
+    fi
+    TARBALL_TMP=""
+    if [ "$downloaded" = "1" ]; then
+        TARBALL_TMP="$tarball"
+    fi
+
+    case "$tarball" in
+        *.zst | *.zstd)
+            command -v zstd > /dev/null 2>&1 || die "zstd is required to extract .zst"
+            ;;
+    esac
+
+    STAGING="$(mktemp -d "${ROOTFS_BASE}/.create-${name}.XXXXXX")" || die "cannot create staging dir in ${ROOTFS_BASE}"
+    trap cleanup_partial EXIT
+
+    info "extracting $(basename "$tarball")"
+    case "$tarball" in
+        *.zst | *.zstd) tar --zstd -xf "$tarball" -C "$STAGING" || die "failed to extract ${tarball}" ;;
+        *) tar -xf "$tarball" -C "$STAGING" || die "failed to extract ${tarball}" ;;
+    esac
+
+    # bootstrap 包里普遍套了一层 root.x86_64/，但别写死这个名字。判据：
+    # 只有一个顶层目录，且它里面有 etc/usr/var/bin/sbin/lib 里的好几个，
+    # 那它就是外壳。只有一个顶层目录但里面不像个根（比如只有 etc/），
+    # 说明那个目录本身就是根的一部分，不能剥。
+    local -a top=()
+    shopt -s nullglob dotglob
+    top=("$STAGING"/*)
+    shopt -u nullglob dotglob
+
+    local src="$STAGING" markers=0 m
+    if [ "${#top[@]}" -eq 1 ] && [ -d "${top[0]}" ] && [ ! -L "${top[0]}" ]; then
+        for m in etc usr var bin sbin lib lib64; do
+            if [ -e "${top[0]}/$m" ] || [ -L "${top[0]}/$m" ]; then
+                markers=$((markers + 1))
+            fi
+        done
+        if [ "$markers" -ge 3 ]; then
+            src="${top[0]}"
+            info "stripping top-level directory: $(basename "$src")"
+        else
+            info "single top-level directory $(basename "${top[0]}") is part of the rootfs, keeping it"
+        fi
+    fi
+
+    mv -- "$src" "$path" || die "failed to move rootfs into ${path}"
+
+    if [ "$downloaded" = "1" ]; then
+        rm -f -- "$tarball"
+        TARBALL_TMP=""
+    fi
+
+    if [ -x "${path}/usr/bin/pacman" ] && [ -d "${path}/etc/pacman.d" ]; then
+        local mirrorlist="${path}/etc/pacman.d/mirrorlist"
+        if [ -f "$mirrorlist" ]; then
+            cp -f -- "$mirrorlist" "${mirrorlist}.dist"
+        fi
+        printf '# written by chroot-utils --create\n%s\n' "$PACMAN_MIRRORS" > "$mirrorlist"
+        info "pacman mirrorlist: tuna / ustc / nju / sjtu（原文件存为 mirrorlist.dist）"
+    else
+        warn "archive has no usr/bin/pacman; skipped Arch post-setup"
+    fi
+
+    info "container '${name}' created at ${path}"
+    info "next:"
+    info "  ${SELF} --start ${name}"
+    info "  容器里第一件事: pacman-key --init && pacman-key --populate archlinux"
 }
 
 do_start() {
-    local container="$1"
-    check_container "${container}"
+    local name="$1"
+    shift
+    local -a cmd=("$@")
+    [ "${#cmd[@]}" -gt 0 ] || cmd=(/bin/bash)
 
-    local container_path="${ROOTFS_BASE}/${container}"
+    validate_name "$name"
+    local path
+    path="$(require_container "$name")"
 
-    do_mount "${container}"
+    command -v unshare > /dev/null 2>&1 || die "unshare(1) not found (util-linux)"
+    if ! unshare --help 2>&1 | grep -q -- '--propagation'; then
+        die "unshare(1) is too old: --propagation is required"
+    fi
 
-    local container_ps1="\[\e[1;31m\][${container}]\[\e[0m\] \u@\h:\w\$ "
+    # 本进程视图里若已有东西挂在容器下，那是旧版本或手工挂载留下的。
+    # 直接在它上面再挂会叠层，所以拒绝，并指向 --cleanup。
+    local stale
+    stale="$(mounts_under "$path" self)"
+    if [ -n "$stale" ]; then
+        printf 'error: %s 下已有挂载（旧版本或手工挂载留下的），不能叠加：\n' "$path" >&2
+        printf '%s\n' "$stale" | sed 's/^/  /' >&2
+        printf '先执行: %s --cleanup %s\n' "$SELF" "$name" >&2
+        exit 1
+    fi
 
-    echo "Entering chroot: ${container}"
-    echo "Type 'exit' to leave the container"
-    echo "---"
+    local -a reenter=("$SELF")
+    [ -x "$SELF" ] || reenter=("${BASH:-/bin/bash}" "$SELF")
 
-    sudo PS1="${container_ps1}" chroot "${container_path}" /bin/bash || true
+    info "entering chroot: ${name} (private mount namespace)"
+    info "the container's mounts live only in this session; exit to drop them"
+    info "---"
+    exec unshare -m --propagation private -- "${reenter[@]}" __enter "$name" "${cmd[@]}"
+}
 
-    echo "---"
-    echo "Exited chroot. Unmounting..."
-    do_umount "${container}"
+do_enter() {
+    local name="$1"
+    shift
+    local -a cmd=("$@")
+    [ "${#cmd[@]}" -gt 0 ] || cmd=(/bin/bash)
+
+    [ "$(id -u)" -eq 0 ] || die "internal: __enter must run as root"
+
+    validate_name "$name"
+    local path
+    path="$(require_container "$name")"
+
+    mkdir -p "${path}/proc" "${path}/sys" "${path}/dev"
+
+    # 新 proc 实例优先；某些受限环境不允许就直接 rbind 宿主机的。
+    # rbind 之后必须 rslave，否则 /dev、/sys 上的共享子树会把这里的
+    # 改动回传给宿主机。
+    if ! mount -t proc proc "${path}/proc" 2> /dev/null; then
+        mount --rbind /proc "${path}/proc" || die "failed to mount /proc"
+        mount --make-rslave "${path}/proc" || die "failed to make /proc rslave"
+    fi
+    mount --rbind /sys "${path}/sys" || die "failed to mount /sys"
+    mount --make-rslave "${path}/sys" || die "failed to make /sys rslave"
+    mount --rbind /dev "${path}/dev" || die "failed to mount /dev"
+    mount --make-rslave "${path}/dev" || die "failed to make /dev rslave"
+
+    # 容器里要能解析 DNS。宿主那份 resolv.conf 只读 bind 进来，同样只活在
+    # 这个命名空间里。容器内没有这个文件就先建一个空壳当挂载点；是符号链接
+    # 的（systemd-resolved 那套）不动，避免把链接指向的目标顶掉。
+    if [ -f /etc/resolv.conf ] && [ -d "${path}/etc" ] && [ ! -L "${path}/etc/resolv.conf" ]; then
+        [ -e "${path}/etc/resolv.conf" ] || : > "${path}/etc/resolv.conf"
+        mount --bind -o ro /etc/resolv.conf "${path}/etc/resolv.conf" \
+            || warn "failed to bind /etc/resolv.conf; DNS inside may not work"
+    fi
+
+    local manifest
+    manifest="$(manifest_path "$name")"
+    if [ -f "$manifest" ]; then
+        local host cdir target
+        while IFS=$'\t' read -r host cdir; do
+            [ -n "${cdir:-}" ] || continue
+            target="${path}${cdir}"
+            [ -d "$target" ] || mkdir -p "$target"
+            mount --bind "$host" "$target" || die "failed to bind ${host} -> ${target}"
+            info "bind: ${host} -> ${cdir}"
+        done < "$manifest"
+    fi
+
+    local ps1
+    ps1="\[\e[1;31m\][${name}]\[\e[0m\] \u@\h:\w\$ "
+    export PS1="$ps1"
+    export TERM="${TERM:-xterm}"
+
+    exec chroot "$path" "${cmd[@]}"
+}
+
+# 容器内路径必须是绝对路径，且不能借 .. 逃出 rootfs，也不能顶掉
+# 由本脚本自己管的 proc/sys/dev。
+normalize_container_dir() {
+    local cdir="${1-}"
+    case "$cdir" in
+        /*) ;;
+        *) die "container directory must be absolute: '${cdir}'" ;;
+    esac
+    case "$cdir" in
+        *//*) die "container directory must not contain empty component: '${cdir}'" ;;
+        */../* | */.. | /..*) die "container directory must not contain '..': '${cdir}'" ;;
+    esac
+    while [ "${#cdir}" -gt 1 ] && [ "${cdir%/}" != "$cdir" ]; do
+        cdir="${cdir%/}"
+    done
+    [ "$cdir" != "/" ] || die "refusing to bind over the container root"
+    case "$cdir" in
+        /proc | /proc/* | /sys | /sys/* | /dev | /dev/*)
+            die "container directory '${cdir}' is managed by chroot-utils"
+            ;;
+    esac
+    printf '%s' "$cdir"
+}
+
+manifest_drop() {
+    local manifest="$1" cdir="$2" tmp
+    [ -f "$manifest" ] || return 0
+    tmp="$(mktemp "${manifest}.XXXXXX")"
+    awk -F'\t' -v target="$cdir" 'NF >= 2 && $2 != target' "$manifest" > "$tmp"
+    mv -f "$tmp" "$manifest"
+}
+
+do_bind_add() {
+    local name="$1" host_dir="$2" cdir
+    validate_name "$name"
+    local path
+    path="$(require_container "$name")"
+    cdir="$(normalize_container_dir "$3")"
+
+    host_dir="$(readlink -f "$host_dir")" || die "host directory does not exist: '$2'"
+    [ -d "$host_dir" ] || die "host path is not a directory: ${host_dir}"
+
+    mkdir -p "${path}${cdir}"
+    mkdir -p "$STATE_BASE"
+    local manifest
+    manifest="$(manifest_path "$name")"
+    manifest_drop "$manifest" "$cdir"
+    printf '%s\t%s\n' "$host_dir" "$cdir" >> "$manifest"
+
+    info "registered: ${host_dir} -> ${name}:${cdir}"
+    info "applies on the next --start; a session already running is not touched"
+}
+
+do_bind_del() {
+    local name="$1" cdir
+    validate_name "$name"
+    require_container "$name" > /dev/null
+    cdir="$(normalize_container_dir "$2")"
+
+    local manifest
+    manifest="$(manifest_path "$name")"
+    if [ ! -f "$manifest" ] || ! awk -F'\t' -v target="$cdir" 'NF >= 2 && $2 == target { f = 1 } END { exit !f }' "$manifest"; then
+        info "not registered: ${name}:${cdir}"
+        return 0
+    fi
+    manifest_drop "$manifest" "$cdir"
+    info "dropped: ${name}:${cdir}"
+}
+
+do_bind_list() {
+    local name="$1"
+    validate_name "$name"
+    require_container "$name" > /dev/null
+
+    local manifest
+    manifest="$(manifest_path "$name")"
+    if [ ! -s "$manifest" ]; then
+        info "no bind mounts registered for '${name}'"
+        return 0
+    fi
+    info "bind mounts for '${name}' (applied at --start):"
+    awk -F'\t' 'NF >= 2 { printf "  %-40s -> %s\n", $1, $2 }' "$manifest"
 }
 
 do_rm() {
-    local container="$1"
-    check_container "${container}"
+    local name="$1" assume_yes="${2:-0}"
+    validate_name "$name"
+    local path
+    path="$(require_container "$name")"
 
-    local container_path="${ROOTFS_BASE}/${container}"
+    [ -L "$path" ] && die "refusing: ${path} is a symlink"
 
-    do_umount "${container}"
-
-    echo "Removing container '${container}'..."
-    sudo rm -rf "${container_path}"
-    echo "Container '${container}' removed"
-}
-
-do_mount_dir() {
-    local container="$1"
-    local host_dir="$2"
-    local container_dir="$3"
-
-    check_container "${container}"
-
-    local container_path="${ROOTFS_BASE}/${container}"
-    local target="${container_path}${container_dir}"
-
-    if [ ! -d "${host_dir}" ]; then
-        echo "Error: host directory '${host_dir}' does not exist"
+    local busy
+    if busy="$(container_in_use "$path")"; then
+        printf 'error: 容器里还有进程在跑，先退出它们：\n' >&2
+        printf '  %s\n' "$busy" >&2
         exit 1
     fi
 
-    sudo mkdir -p "${target}"
+    # 旧版本留下的挂载必须先拆。拆不干净就不往下走，rm 绝不在挂载之上执行。
+    local leftover
+    leftover="$(mounts_under "$path" all | sort -r)"
+    if [ -n "$leftover" ]; then
+        info "unmounting leftover mount(s) under ${path} first"
+        unmount_listed <<< "$leftover" || true
+        leftover="$(mounts_under "$path" all)"
+        if [ -n "$leftover" ]; then
+            printf 'error: 仍有挂载没拆掉，已中止，未删除任何文件：\n' >&2
+            printf '%s\n' "$leftover" | sed 's/^/  /' >&2
+            exit 1
+        fi
+    fi
 
-    echo "Mounting ${host_dir} -> ${container}:${container_dir}"
-    sudo mount --bind "${host_dir}" "${target}" || {
-        echo "Error: failed to mount directory"
+    if busy="$(container_in_use "$path")"; then
+        printf 'error: 容器里还有进程在跑，已中止：\n' >&2
+        printf '  %s\n' "$busy" >&2
         exit 1
-    }
+    fi
 
-    echo "Mounted successfully"
-}
+    local size
+    size="$(du -sh "$path" 2> /dev/null | cut -f1)"
+    if [ "$assume_yes" != "1" ]; then
+        [ -t 0 ] || die "refusing to delete non-interactively: pass -y to confirm"
+        printf "delete '%s' (%s) at %s ? type the name to confirm: " "$name" "${size:-?}" "$path"
+        local answer
+        read -r answer
+        [ "$answer" = "$name" ] || die "aborted"
+    fi
 
-do_umount_dir() {
-    local container="$1"
-    local container_dir="$2"
+    info "removing ${path}"
+    local -a rmcmd=(rm -rf)
+    if rm --help 2> /dev/null | grep -q -- '--one-file-system'; then
+        rmcmd+=(--one-file-system)
+    fi
+    rmcmd+=(-- "$path")
+    "${rmcmd[@]}" || die "failed to remove ${path}"
+    rm -f "$(manifest_path "$name")"
 
-    check_container "${container}"
-
-    local container_path="${ROOTFS_BASE}/${container}"
-    local target="${container_path}${container_dir}"
-
-    echo "Unmounting ${container}:${container_dir}"
-    sudo umount -l "${target}" || {
-        echo "Warning: failed to unmount or not mounted"
-    }
-
-    echo "Unmounted successfully"
+    info "container '${name}' removed"
 }
 
 do_list() {
-    echo "Available containers in ${ROOTFS_BASE}:"
-    echo "---"
+    info "containers in ${ROOTFS_BASE}:"
+    info "---"
 
-    if [ ! -d "${ROOTFS_BASE}" ]; then
-        echo "(no containers found - ${ROOTFS_BASE} does not exist)"
-        exit 0
+    if [ ! -d "$ROOTFS_BASE" ]; then
+        info "(none - ${ROOTFS_BASE} does not exist)"
+        return 0
     fi
 
-    local found=0
+    local found=0 dir name size binds state manifest
     for dir in "${ROOTFS_BASE}"/*/; do
-        if [ -d "${dir}" ]; then
-            local name=$(basename "${dir}")
-            local size=$(du -sh "${dir}" 2>/dev/null | cut -f1)
-            echo "  ${name} (${size})"
-            found=1
+        [ -d "$dir" ] || continue
+        name="$(basename "$dir")"
+        case "$name" in .*) continue ;; esac
+        found=1
+        size="$(du -sh "$dir" 2> /dev/null | cut -f1)"
+        manifest="$(manifest_path "$name")"
+        binds=0
+        [ -f "$manifest" ] && binds="$(awk -F'\t' 'NF >= 2' "$manifest" | wc -l)"
+        state=""
+        if container_in_use "${dir%/}" > /dev/null 2>&1; then
+            state=" [running]"
         fi
+        printf '  %-20s %-8s %s bind(s)%s\n' "$name" "${size:-?}" "$binds" "$state"
     done
 
-    if [ ${found} -eq 0 ]; then
-        echo "(no containers found)"
+    if [ "$found" -eq 0 ]; then
+        info "(no containers found)"
     fi
 }
 
-if [ $# -lt 1 ]; then
-    usage
-fi
-
-case "$1" in
-    --start|-s)
-        [ $# -lt 2 ] && { echo "Error: container name required"; exit 1; }
-        do_start "$2"
+case "${1-}" in
+    --help | -h | "")
+        usage
         ;;
-    --rm|-r)
-        [ $# -lt 2 ] && { echo "Error: container name required"; exit 1; }
-        do_rm "$2"
-        ;;
-    --mount|-m)
-        [ $# -lt 4 ] && { echo "Error: container, host_dir, and container_dir required"; exit 1; }
-        do_mount_dir "$2" "$3" "$4"
-        ;;
-    --umount|-u)
-        [ $# -lt 3 ] && { echo "Error: container and container_dir required"; exit 1; }
-        do_umount_dir "$2" "$3"
-        ;;
-    --list|-l)
+    --list | -l)
         do_list
         ;;
-    --help|-h)
-        usage
-        ;;
-    --version|-V)
-        echo "chroot-utils v${VERSION}"
+    --version | -V)
+        printf 'chroot-utils v%s\n' "$VERSION"
         ;;
     *)
-        echo "Error: unknown option '$1'"
-        usage
+        # 除只读命令外都需要 root。__enter 由 --start 在命名空间里回调，
+        # 那时已经是 root，不会再走这里。
+        case "$1" in
+            __enter) ;;
+            *)
+                if [ "$(id -u)" -ne 0 ]; then
+                    command -v sudo > /dev/null 2>&1 || die "must run as root"
+                    exec sudo -E "$SELF" "$@"
+                fi
+                ;;
+        esac
+
+        case "$1" in
+            --create | -c)
+                [ $# -ge 2 ] || die "container name required"
+                do_create "$2" "${3-}"
+                ;;
+            --start | -s)
+                [ $# -ge 2 ] || die "container name required"
+                name="$2"
+                shift 2
+                [ "${1-}" = "--" ] && shift
+                do_start "$name" "$@"
+                ;;
+            __enter)
+                [ $# -ge 2 ] || die "internal: __enter needs a container name"
+                name="$2"
+                shift 2
+                do_enter "$name" "$@"
+                ;;
+            --mount | -m)
+                [ $# -ge 4 ] || die "usage: --mount <container> <host_dir> <container_dir>"
+                do_bind_add "$2" "$3" "$4"
+                ;;
+            --umount | -u)
+                [ $# -ge 3 ] || die "usage: --umount <container> <container_dir>"
+                do_bind_del "$2" "$3"
+                ;;
+            --mounts)
+                [ $# -ge 2 ] || die "usage: --mounts <container>"
+                do_bind_list "$2"
+                ;;
+            --rm | -r)
+                [ $# -ge 2 ] || die "container name required"
+                name="$2"
+                if [ "${3-}" = "-y" ] || [ "${3-}" = "--yes" ]; then
+                    do_rm "$name" 1
+                else
+                    do_rm "$name" 0
+                fi
+                ;;
+            --cleanup)
+                [ $# -ge 2 ] || die "container name required"
+                do_cleanup "$2"
+                ;;
+            *)
+                printf 'error: unknown option %s\n' "$1" >&2
+                usage
+                ;;
+        esac
         ;;
 esac
